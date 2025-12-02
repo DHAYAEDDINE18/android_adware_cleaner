@@ -1,5 +1,5 @@
 <img width="1358" height="725" alt="image" src="https://github.com/user-attachments/assets/465030dd-39f4-4393-a6f3-d089689453df" />
-````markdown
+
 # Android Adware Cleaner (ADB + Google GenAI)
 
 A small desktop GUI tool (Tkinter) that connects to an Android device via ADB, lists installed packages, and helps you spot and remove potential adware.  
