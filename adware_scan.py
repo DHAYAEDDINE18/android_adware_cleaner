@@ -73,7 +73,9 @@ def get_recent_packages(device):
             pkgs.add(m.group(1))
     return sorted(pkgs)
 
-def is_whitelisted(pkg):
+def is_whitelisted(pkg, user_whitelist=None):
+    if user_whitelist and pkg in user_whitelist:
+        return True
     if pkg in WHITELIST_PACKAGES:
         return True
     return any(pkg.startswith(p) for p in WHITELIST_PREFIXES)
@@ -143,27 +145,226 @@ class App(tk.Tk):
         self.model_var = tk.StringVar(value=DEFAULT_MODEL)
         self.dry_run_var = tk.BooleanVar(value=True)
         self.filter_var = tk.StringVar(value="")
+        self.auto_refresh_var = tk.BooleanVar(value=False)
+        self.refresh_time_var = tk.StringVar(value="5")
+        self.add_to_db_var = tk.BooleanVar(value=False)
+        self._refresh_job = None
+        self.known_adware = set()
+        self.user_whitelist = set()
+        self.theme_var = tk.StringVar(value="White")
+
+        self.load_known_adware()
+        self.load_user_whitelist()
+
+        # Theme setup
+        style = ttk.Style(self)
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+        self._style = style
+        self.apply_theme("White")  # default
 
         self.create_widgets()
         # Global key binding: press K to full scan (AI)
         self.bind_all("<Key-k>", lambda e: self.on_scan_click())
         self.after(200, self.preflight_adb)
 
+    # ---------- Theme ----------
+    THEMES = {
+        "Dark": {
+            "bg":        "#2d2d2d",
+            "fg":        "#e0e0e0",
+            "field_bg":  "#333333",
+            "sel_bg":    "#005599",
+            "tab_sel":   "#2d2d2d",
+            "log_bg":    "#2b2b2b",
+            "log_fg":    "#e0e0e0",
+        },
+        "White": {
+            "bg":        "#f5f5f5",
+            "fg":        "#1a1a1a",
+            "field_bg":  "#ffffff",
+            "sel_bg":    "#4a90d9",
+            "tab_sel":   "#f5f5f5",
+            "log_bg":    "#ffffff",
+            "log_fg":    "#1a1a1a",
+        },
+        "Black": {
+            "bg":        "#000000",
+            "fg":        "#cccccc",
+            "field_bg":  "#111111",
+            "sel_bg":    "#004488",
+            "tab_sel":   "#000000",
+            "log_bg":    "#0a0a0a",
+            "log_fg":    "#cccccc",
+        },
+    }
+
+    def apply_theme(self, name):
+        t = self.THEMES.get(name, self.THEMES["Dark"])
+        self.configure(bg=t["bg"])
+        s = self._style
+        s.configure(".",
+            background=t["bg"], foreground=t["fg"],
+            fieldbackground=t["field_bg"], insertcolor=t["fg"])
+        s.configure("Treeview",
+            background=t["field_bg"], foreground=t["fg"],
+            fieldbackground=t["field_bg"])
+        s.map("Treeview", background=[("selected", t["sel_bg"])])
+        s.configure("TButton", background=t["field_bg"], foreground=t["fg"])
+        s.configure("TLabelFrame", background=t["bg"], foreground=t["fg"])
+        s.configure("TNotebook", background=t["bg"])
+        s.configure("TNotebook.Tab", background=t["field_bg"], foreground=t["fg"])
+        s.map("TNotebook.Tab", background=[("selected", t["tab_sel"])])
+        s.configure("TFrame", background=t["bg"])
+        s.configure("TLabel", background=t["bg"], foreground=t["fg"])
+        s.configure("TCheckbutton", background=t["bg"], foreground=t["fg"])
+        s.configure("TCombobox",
+            fieldbackground=t["field_bg"], foreground=t["fg"],
+            background=t["field_bg"])
+        # Update log widget if it already exists
+        if hasattr(self, "log"):
+            self.log.configure(bg=t["log_bg"], fg=t["log_fg"],
+                               insertbackground=t["fg"])
+
+    def on_theme_change(self, *_):
+        self.apply_theme(self.theme_var.get())
+
+    def load_known_adware(self):
+        self.known_adware = set()
+        if os.path.exists("known_adware.txt"):
+            try:
+                with open("known_adware.txt", "r") as f:
+                    for line in f:
+                        pkg = line.strip()
+                        if pkg:
+                            self.known_adware.add(pkg)
+            except Exception as e:
+                pass
+
+    def add_to_known_adware(self, pkg):
+        if pkg not in self.known_adware:
+            self.known_adware.add(pkg)
+            try:
+                with open("known_adware.txt", "a") as f:
+                    f.write(pkg + "\n")
+            except Exception as e:
+                pass
+
+    def toggle_auto_refresh(self):
+        if self.auto_refresh_var.get():
+            self.auto_refresh_loop()
+        else:
+            if self._refresh_job is not None:
+                self.after_cancel(self._refresh_job)
+                self._refresh_job = None
+            self.log_msg("Auto-refresh stopped.")
+
+    def auto_refresh_loop(self):
+        if not self.auto_refresh_var.get():
+            return
+        
+        if self.device:
+            self.on_scan_recent_only(silent=True)
+
+        try:
+            delay_sec = float(self.refresh_time_var.get())
+            if delay_sec <= 0: delay_sec = 5
+        except ValueError:
+            delay_sec = 5
+            self.refresh_time_var.set("5")
+            
+        self._refresh_job = self.after(int(delay_sec * 1000), self.auto_refresh_loop)
+
+    def load_user_whitelist(self):
+        self.user_whitelist = set()
+        if os.path.exists("whitelist.txt"):
+            try:
+                with open("whitelist.txt", "r") as f:
+                    for line in f:
+                        if line.strip(): self.user_whitelist.add(line.strip())
+            except Exception: pass
+
+    def add_to_whitelist(self, pkg):
+        if pkg not in self.user_whitelist:
+            self.user_whitelist.add(pkg)
+            try:
+                with open("whitelist.txt", "a") as f:
+                    f.write(pkg + "\n")
+            except Exception: pass
+        self.log_msg(f"Added {pkg} to Safe Apps Whitelist.")
+        self.refresh_installed()
+
+    def export_log(self):
+        from tkinter import filedialog
+        path = filedialog.asksaveasfilename(defaultextension=".txt", initialfile="adware_cleaner_log.txt", title="Save Log")
+        if path:
+            try:
+                with open(path, "w") as f:
+                    f.write(self.log.get("1.0", "end"))
+                messagebox.showinfo("Export Log", "Log saved successfully.")
+            except Exception as e:
+                messagebox.showerror("Export Failed", str(e))
+
+    def show_context_menu(self, event, tree):
+        iid = tree.identify_row(event.y)
+        if iid:
+            tree.selection_set(iid)
+            pkg = tree.item(iid, "values")[0]
+            menu = tk.Menu(self, tearoff=0)
+            menu.add_command(label="Mark as Safe (Whitelist)", command=lambda: self.add_to_whitelist(pkg))
+            menu.add_command(label="Open in Play Store", command=lambda: self.open_play_store(pkg))
+            menu.add_command(label="Check Permissions", command=lambda: self.check_permissions(pkg))
+            menu.post(event.x_root, event.y_root)
+
+    def open_play_store(self, pkg):
+        import webbrowser
+        webbrowser.open(f"https://play.google.com/store/apps/details?id={pkg}")
+        self.log_msg(f"Opened Play Store for {pkg}")
+
+    def check_permissions(self, pkg):
+        if not self.device: return
+        def task():
+            code, out, err = adb(["shell", "dumpsys", "package", pkg], device=self.device)
+            perms = []
+            capture = False
+            for line in (out or "").splitlines():
+                if "requested permissions:" in line: capture = True
+                elif "install permissions:" in line or "runtime permissions:" in line or "queries:" in line: capture = False
+                elif capture and line.strip().startswith("android.permission"):
+                    perms.append(line.strip())
+            disp = "\n".join(perms) if perms else "No permissions found or failed to parse."
+            self.after(0, lambda: messagebox.showinfo(f"Permissions: {pkg}", disp))
+        threading.Thread(target=task, daemon=True).start()
+
     def create_widgets(self):
-        # Top bar
+        # ---- Row 1: Connection controls ----
         top = ttk.Frame(self)
-        top.pack(fill="x", padx=10, pady=8)
+        top.pack(fill="x", padx=10, pady=(8, 2))
         ttk.Button(top, text="Connect USB", command=self.connect_usb).pack(side="left", padx=4)
         ttk.Button(top, text="Connect Wireless", command=self.connect_wireless).pack(side="left", padx=4)
         self.dev_label = ttk.Label(top, text="Device: <none>")
         self.dev_label.pack(side="left", padx=10)
         ttk.Button(top, text="List Installed", command=self.refresh_installed).pack(side="left", padx=4)
         ttk.Checkbutton(top, text="Dry run", variable=self.dry_run_var).pack(side="left", padx=10)
-
-        # Scan buttons
-        ttk.Button(top, text="Ad appears: Scan now (K)", command=self.on_scan_click).pack(side="left", padx=6)
-        ttk.Button(top, text="Scan Recent (no AI)", command=self.on_scan_recent_only).pack(side="left", padx=6)
         ttk.Button(top, text="Restart ADB", command=self.restart_adb).pack(side="left", padx=6)
+        # Theme selector on the right of row 1
+        theme_menu = ttk.OptionMenu(
+            top, self.theme_var, self.theme_var.get(),
+            *self.THEMES.keys(),
+            command=self.on_theme_change,
+        )
+        theme_menu.pack(side="right", padx=(0, 6))
+        ttk.Label(top, text="Theme:").pack(side="right", padx=(4, 2))
+
+        # ---- Row 2: Scan controls ----
+        top2 = ttk.Frame(self)
+        top2.pack(fill="x", padx=10, pady=(0, 6))
+        ttk.Button(top2, text="Ad appears: Scan now (K)", command=self.on_scan_click).pack(side="left", padx=6)
+        ttk.Button(top2, text="Scan Recent (no AI)", command=self.on_scan_recent_only).pack(side="left", padx=6)
+        ttk.Button(top2, text="Scan Hidden Apps", command=self.on_scan_hidden).pack(side="left", padx=6)
+        ttk.Checkbutton(top2, text="Refresh scanning each", variable=self.auto_refresh_var, command=self.toggle_auto_refresh).pack(side="left", padx=(10, 2))
+        ttk.Entry(top2, textvariable=self.refresh_time_var, width=5).pack(side="left", padx=2)
+        ttk.Label(top2, text="s").pack(side="left", padx=(0, 6))
 
 
         # Gemini panel
@@ -208,6 +409,8 @@ class App(tk.Tk):
         self.uninstall_full_btn = ttk.Button(inst_bar, text="Uninstall (full)", command=self.uninstall_selected_full)
         self.uninstall_full_btn.pack(side="left", padx=4)
 
+        ttk.Checkbutton(inst_bar, text="Add removed app to database", variable=self.add_to_db_var).pack(side="left", padx=8)
+
         self.refresh_inst_btn = ttk.Button(inst_bar, text="Refresh", command=self.refresh_installed)
         self.refresh_inst_btn.pack(side="left", padx=8)
 
@@ -225,14 +428,23 @@ class App(tk.Tk):
         self.suspects_tree = self.make_table(suspects_frame, ("package", "action"), "Suspects")
 
         # Log panel
-        self.log = tk.Text(self, height=8, wrap="word")
-        self.log.pack(fill="x", padx=10, pady=(0,8))
+        log_frame = ttk.Frame(self)
+        log_frame.pack(fill="x", padx=10, pady=(0,8))
+        t = self.THEMES.get(self.theme_var.get(), self.THEMES["Dark"])
+        self.log = tk.Text(log_frame, height=8, wrap="word",
+                           bg=t["log_bg"], fg=t["log_fg"],
+                           insertbackground=t["fg"])
+        self.log.pack(side="left", fill="x", expand=True)
         self.log.configure(state="disabled")
+        ttk.Button(log_frame, text="Save Log", command=self.export_log).pack(side="right", padx=(8,0), anchor="s")
 
     def make_table(self, parent, columns, title):
         frame = ttk.Frame(parent)
         frame.pack(fill="both", expand=True)
         tree = ttk.Treeview(frame, columns=columns, show="headings", selectmode="extended")
+        tree.tag_configure("adware", background="#cc6666", foreground="white")
+        tree.tag_configure("whitelist", background="#339933", foreground="white")
+        tree.bind("<Button-3>", lambda e: self.show_context_menu(e, tree))
         for c in columns:
             tree.heading(c, text=c.title())
             tree.column(c, width=520 if c == "package" else 160, anchor="w")
@@ -250,11 +462,104 @@ class App(tk.Tk):
 
     def preflight_adb(self):
         ok, out = check_adb_version()
-        if ok:
-            self.log_msg("ADB OK:\n" + (out or "").strip())
-        else:
+        if not ok:
             self.log_msg("ADB not found. Install Platform-Tools and add to PATH.")
             messagebox.showerror("ADB missing", "ADB not found. Install Platform-Tools and add to PATH.")
+            return
+        self.log_msg("ADB OK: " + (out or "").strip().splitlines()[0])
+        # Auto-detect connected devices
+        threading.Thread(target=self._startup_device_scan, daemon=True).start()
+
+    def _startup_device_scan(self):
+        """Run on a background thread immediately after ADB is confirmed OK."""
+        try:
+            code, out, err = run(["adb", "devices"])
+            if code != 0:
+                self.log_msg("Could not query devices on startup.")
+                return
+            devs = []
+            for line in (out or "").splitlines()[1:]:
+                line = line.strip()
+                if line.endswith("\tdevice") or line.endswith(" device"):
+                    serial = line.split()[0]
+                    devs.append(serial)
+                elif "\tdevice" in line:
+                    serial = line.split("\t")[0]
+                    devs.append(serial)
+            if not devs:
+                self.log_msg("No devices connected at startup.")
+                return
+            if len(devs) == 1:
+                # Auto-select the only device
+                self.after(0, lambda: self._select_device(devs[0]))
+            else:
+                # Multiple devices — show chooser on main thread
+                self.after(0, lambda: self._show_device_chooser(devs))
+        except Exception as e:
+            self.log_msg(f"Startup device scan failed: {e}")
+
+    def _select_device(self, serial):
+        self.device = serial
+        self.dev_label.config(text=f"Device: {serial}")
+        self.log_msg(f"Auto-selected device: {serial}")
+
+    def _show_device_chooser(self, devs):
+        """Modal dialog to pick one device from a list."""
+        dlg = tk.Toplevel(self)
+        dlg.title("Select Device")
+        dlg.resizable(False, False)
+        dlg.grab_set()          # modal
+        dlg.lift()
+        dlg.focus_force()
+
+        # Apply current theme colours
+        t = self.THEMES.get(self.theme_var.get(), self.THEMES["Dark"])
+        dlg.configure(bg=t["bg"])
+
+        ttk.Label(dlg, text="Multiple devices detected.\nSelect the device to use:",
+                  justify="left").pack(padx=20, pady=(16, 8))
+
+        choice_var = tk.StringVar(value=devs[0])
+        lb_frame = ttk.Frame(dlg)
+        lb_frame.pack(padx=20, fill="x")
+        lb = tk.Listbox(lb_frame, selectmode="single", height=min(len(devs), 8),
+                        bg=t["field_bg"], fg=t["fg"],
+                        selectbackground=t["sel_bg"], activestyle="none",
+                        font=("Consolas", 10))
+        for d in devs:
+            lb.insert("end", d)
+        lb.select_set(0)
+        lb.pack(side="left", fill="x", expand=True)
+        vsb = ttk.Scrollbar(lb_frame, orient="vertical", command=lb.yview)
+        lb.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+
+        def confirm():
+            sel = lb.curselection()
+            if not sel:
+                return
+            serial = devs[sel[0]]
+            dlg.destroy()
+            self._select_device(serial)
+
+        def cancel():
+            dlg.destroy()
+            self.log_msg("Device selection cancelled.")
+
+        btn_frame = ttk.Frame(dlg)
+        btn_frame.pack(pady=(10, 16))
+        ttk.Button(btn_frame, text="Connect", command=confirm).pack(side="left", padx=8)
+        ttk.Button(btn_frame, text="Cancel",  command=cancel).pack(side="left", padx=8)
+        dlg.bind("<Return>", lambda e: confirm())
+        dlg.bind("<Escape>", lambda e: cancel())
+
+        # Centre over parent
+        self.update_idletasks()
+        dlg.update_idletasks()
+        pw, ph = self.winfo_width(), self.winfo_height()
+        px, py = self.winfo_rootx(), self.winfo_rooty()
+        dw, dh = dlg.winfo_reqwidth(), dlg.winfo_reqheight()
+        dlg.geometry(f"+{px + (pw - dw)//2}+{py + (ph - dh)//2}")
 
     # ---------- Connect ----------
     def connect_usb(self):
@@ -264,15 +569,20 @@ class App(tk.Tk):
                 self.log_msg("adb devices failed.")
                 return
             devs = []
-            for line in out.splitlines()[1:]:
-                if "\tdevice" in line:
+            for line in (out or "").splitlines()[1:]:
+                line = line.strip()
+                if line.endswith("\tdevice") or line.endswith(" device"):
+                    serial = line.split()[0]
+                    devs.append(serial)
+                elif "\tdevice" in line:
                     devs.append(line.split("\t")[0])
             if not devs:
-                self.log_msg("No USB device. Plug in and authorize USB debugging.")
+                self.log_msg("No USB device found. Plug in and authorize USB debugging.")
                 return
-            self.device = devs[0]
-            self.dev_label.config(text=f"Device: {self.device}")
-            self.log_msg(f"Using USB device: {self.device}")
+            if len(devs) == 1:
+                self.after(0, lambda: self._select_device(devs[0]))
+            else:
+                self.after(0, lambda: self._show_device_chooser(devs))
         threading.Thread(target=task, daemon=True).start()
     def restart_adb(self):
         # Run ADB server restart without blocking UI
@@ -458,7 +768,13 @@ class App(tk.Tk):
     def populate(self, tree, rows):
         tree.delete(*tree.get_children())
         for r in rows:
-            tree.insert("", "end", values=r)
+            pkg = r[0]
+            if getattr(self, "known_adware", None) and pkg in self.known_adware:
+                tree.insert("", "end", values=r, tags=("adware",))
+            elif getattr(self, "user_whitelist", None) and pkg in self.user_whitelist:
+                tree.insert("", "end", values=r, tags=("whitelist",))
+            else:
+                tree.insert("", "end", values=r)
 
     def get_selected_installed(self):
         sel = self.installed_tree.selection()
@@ -485,6 +801,8 @@ class App(tk.Tk):
             for pkg in pkgs:
                 ok = uninstall_user0(self.device, pkg)
                 self.log_msg(f"Uninstall (user 0) {pkg}: {'Success' if ok else 'Failed'}")
+                if ok and getattr(self, "add_to_db_var", None) and self.add_to_db_var.get():
+                    self.add_to_known_adware(pkg)
             try:
                 pkgs2 = list_installed(self.device, user_only=ONLY_USER_APPS)
                 self.installed = pkgs2
@@ -513,6 +831,8 @@ class App(tk.Tk):
                 code, out, err = adb(["uninstall", pkg], device=self.device)
                 ok = (code == 0) or ("Success" in (out or ""))
                 self.log_msg(f"Uninstall (full) {pkg}: {'Success' if ok else 'Failed'}")
+                if ok and getattr(self, "add_to_db_var", None) and self.add_to_db_var.get():
+                    self.add_to_known_adware(pkg)
             try:
                 pkgs2 = list_installed(self.device, user_only=ONLY_USER_APPS)
                 self.installed = pkgs2
@@ -545,23 +865,52 @@ class App(tk.Tk):
         threading.Thread(target=task, daemon=True).start()
 
     # ---------- Scan flows ----------
-    def on_scan_recent_only(self):
+    def on_scan_hidden(self):
         if not self.device:
             messagebox.showwarning("No device", "Connect a device first.")
             return
-        self.log_msg("Scanning recent/foreground apps (no AI)...")
+        self.log_msg("Scanning for hidden apps (no launcher icon)...")
+        def task():
+            try:
+                all_pkgs = list_installed(self.device, user_only=ONLY_USER_APPS)
+                hidden = []
+                wl = getattr(self, "user_whitelist", set())
+                self.log_msg(f"Checking {len(all_pkgs)} packages...")
+                for p in all_pkgs:
+                    if is_whitelisted(p, wl): continue
+                    c, o, e = adb(["shell", "cmd", "package", "resolve-activity", "--brief", p], device=self.device)
+                    if "No activity found" in (o or "") or not o.strip():
+                        hidden.append(p)
+
+                self.suspects = hidden
+                self.after(0, lambda: self.populate(self.suspects_tree, [(p, "hidden") for p in hidden]))
+                
+                if hidden:
+                    self.log_msg("Found hidden packages: " + ", ".join(hidden))
+                else:
+                    self.log_msg("No hidden non-whitelisted packages found.")
+            except Exception as e:
+                self.log_msg(f"Hidden scan failed: {e}")
+        threading.Thread(target=task, daemon=True).start()
+
+    def on_scan_recent_only(self, silent=False):
+        if not self.device:
+            if not silent: messagebox.showwarning("No device", "Connect a device first.")
+            return
+        if not silent: self.log_msg("Scanning recent/foreground apps (no AI)...")
         def task():
             try:
                 recent = get_recent_packages(self.device)
                 self.recent = recent
                 self.populate(self.recent_tree, [(p,) for p in recent])
-                recent_non_sys = [p for p in recent if not is_whitelisted(p)]
-                if recent_non_sys:
-                    self.log_msg("Recent non-whitelisted packages: " + ", ".join(recent_non_sys))
-                else:
-                    self.log_msg("No non-whitelisted recent packages found.")
+                recent_non_sys = [p for p in recent if not is_whitelisted(p, getattr(self, "user_whitelist", set()))]
+                if not silent:
+                    if recent_non_sys:
+                        self.log_msg("Recent non-whitelisted packages: " + ", ".join(recent_non_sys))
+                    else:
+                        self.log_msg("No non-whitelisted recent packages found.")
             except Exception as e:
-                self.log_msg(f"Recent-only scan failed: {e}")
+                if not silent: self.log_msg(f"Recent-only scan failed: {e}")
         threading.Thread(target=task, daemon=True).start()
 
     def on_scan_click(self):
@@ -577,13 +926,14 @@ class App(tk.Tk):
         def task():
             try:
                 recent = get_recent_packages(self.device)
-                recent_f = [p for p in recent if not is_whitelisted(p)]
+                wl = getattr(self, "user_whitelist", set())
+                recent_f = [p for p in recent if not is_whitelisted(p, wl)]
                 self.recent = recent
                 self.populate(self.recent_tree, [(p,) for p in recent])
 
                 client = make_client(key)
                 suspects = gemini_pick_suspects(client, model, self.installed or [], recent_f or recent)
-                suspects = [p for p in suspects if not is_whitelisted(p)]
+                suspects = [p for p in suspects if not is_whitelisted(p, wl)]
                 self.suspects = suspects
                 self.populate(self.suspects_tree, [(p, "planned" if self.dry_run_var.get() else "remove") for p in suspects])
 
@@ -597,6 +947,8 @@ class App(tk.Tk):
                 for pkg in suspects:
                     ok = uninstall_user0(self.device, pkg)
                     self.log_msg(f"Uninstall {pkg}: {'Success' if ok else 'Failed'}")
+                    if ok and getattr(self, "add_to_db_var", None) and self.add_to_db_var.get():
+                        self.add_to_known_adware(pkg)
 
                 try:
                     pkgs = list_installed(self.device, user_only=ONLY_USER_APPS)
